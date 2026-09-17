@@ -1,15 +1,34 @@
-# gpcprobe — GA100 GPC floorsweep fuse probe
+# gpcprobe — GA100 floorsweep fuse probe (GPC + FBP)
 
-Reads the GA100 GPC floorsweep fuses straight out of BAR0:
+Reads the GA100 floorsweep/restriction fuses straight out of BAR0:
 
-| Register        | BAR0 offset | Meaning                                    |
-|-----------------|-------------|--------------------------------------------|
-| `OPT_GPC_DISABLE`   | `0x00820350` | one bit per GPC group — fused OFF          |
-| `OPT_GPC_DEFECTIVE` | `0x008205c4` | one bit per GPC group — marked dead        |
+| Register          | BAR0 offset | Meaning                                        |
+|-------------------|-------------|-------------------------------------------------|
+| `OPT_GPC_DISABLE`   | `0x00820350` | one bit per GPC (8 groups) — fused OFF           |
+| `OPT_GPC_DEFECTIVE` | `0x008205C4` | one bit per GPC — marked dead                    |
+| `OPT_FBP_DISABLE`   | `0x00820364` | one bit per FBP (12 memory partitions) — OFF     |
+| `OPT_FBP_DEFECTIVE`  | `0x008205CC` | one bit per FBP — physically dead (not just floorswept) |
+| `OPT_FBPA_DEFECTIVE` | `0x008205D0` | one bit per FBPA — physically dead             |
+| `OPT_FBIO_DEFECTIVE` | `0x008205D4` | one bit per FBIO — physically dead             |
+| `OPT_ROP_L2_DISABLE`   | `0x008202C4` | one bit per ROP/L2 slice — fused OFF (mirrors `OPT_FBPA_DISABLE`) |
+| `OPT_ROP_L2_DEFECTIVE` | `0x008205E8` | one bit per ROP/L2 slice — physically dead      |
+| `OPT_FBPA_DISABLE`  | `0x00820368` | one bit per FBPA (24, two per FBP) — OFF         |
+| `OPT_FBIO_DISABLE`  | `0x0082036C` | one bit per FBIO (24) — OFF                      |
+| `STATUS_OPT_GPC`    | `0x00820C1C` | read-only shadow of `OPT_GPC_DISABLE`            |
+| `STATUS_FBP`        | `0x00820D38` | read-only shadow of `OPT_FBP_DISABLE`            |
+| `STATUS_FBPA`       | `0x00820C18` | read-only shadow of `OPT_FBPA_DISABLE`           |
+| `STATUS_OPT_FBIO`   | `0x00820C14` | read-only shadow of `OPT_FBIO_DISABLE`           |
 
 Strictly **read-only**: the module only `ioremap`s BAR0 and issues `readl`.
 It never writes to the BAR, and the nvidia driver keeps full ownership of
 the device (no unbind, no reboot).
+
+Offset provenance: JRex286's Ampere fuse probe and the
+Consensus-Protocol/cmp170hx register docs
+([gist](https://gist.github.com/JRex286/0480d2b2b35ad594e57b6543952be307),
+covers the full Ampere line including the CMP 170HX). Validated on this
+hardware: on each card every `STATUS_*` shadow equals its fuse's value, so
+a mis-assigned offset would have shown up as a mismatch.
 
 ## Why a kernel module at all
 
@@ -49,6 +68,8 @@ make
 Rebuild after every kernel upgrade (the module is version-pinned to
 `/lib/modules/$(uname -r)/build`).
 
+The script prints a per-card detail block, then a **Summary** table (one row per card). The Card column carries the BDF, model name and total memory (queried from nvidia-smi, matched by PCI bus id; shows a question mark if nvidia-smi is unavailable); the remaining columns carry the healthy / disabled / defective counts for GPCs and FBPs (the bit indices are in the per-card detail). FBPA/FBIO detail stays in the per-card block.
+
 ## Usage
 
 ```sh
@@ -66,19 +87,34 @@ sudo rmmod gpcprobe
 ## Output
 
 ```
-Card   Disabled clusters    Marked defective   Disabled but not defective
-06     0, 1, 3              3                  0, 1
-       (raw: OPT_GPC_DISABLE=0x0000000b OPT_GPC_DEFECTIVE=0x00000008)
-05     0, 2, 7              7                  0, 2
-       (raw: OPT_GPC_DISABLE=0x00000085 OPT_GPC_DEFECTIVE=0x00000080)
+== Card 06  (0000:06:00.0) ==
+  GPC  (compute clusters)
+    OPT_GPC_DISABLE    0x0000000b  GPCs 0, 1, 3        5/8 active
+    OPT_GPC_DEFECTIVE  0x00000008  GPCs 3              7/8 active
+    disabled not defective          0, 1
+  FBP  (memory partitions)
+    OPT_FBP_DISABLE    0x00000852  FBPs 1, 4, 6, 11    8/12 active
+    OPT_FBPA_DISABLE   0x00c0330c  FBPAs 2,3,8,9,12,13,22,23  16/24 active
+    OPT_FBIO_DISABLE   0x00c0330c  FBIOs 2,3,8,9,12,13,22,23  16/24 active
+  status shadows (should equal fuses)
+    STATUS_OPT_GPC     0x0000000b  [ok]
+    STATUS_FBP         0x00000852  [ok]
+    STATUS_FBPA        0x00c0330c  [ok]
+    STATUS_OPT_FBIO    0x00c0330c  [ok]
 ```
 
-- **Card** — PCI slot (bus number) of the GPU.
-- **Disabled clusters** — GPC groups masked off in `OPT_GPC_DISABLE`
-  (bit N = GPC N). GA100 die: 8 GPCs x 14 SMs (7 TPCs x 2 SMs) = 112 SMs full die; these cards run 5 GPCs = 70 SMs = 4480 CUDA cores.
-- **Marked defective** — GPCs the fuser marked dead.
-- **Disabled but not defective** — GPCs trimmed by the floorsweep but *not*
-  fused as defective, i.e. intentional cuts rather than die repairs.
+- **GPC (8 on GA100, 14 SMs each, 7 TPCs × 2 SMs = 112 SMs full die):**
+  compute clusters. `disabled not defective` = trimmed by the floorsweep but
+  not fused dead — intentional cuts rather than die repairs. GPC fuses are
+  **per-die** (each card differs).
+- **FBP / FBPA / FBIO:** the memory side. 12 FBPs (8 active here × 640 bits =
+  the full 5120-bit HBM interface), each FBP split into 2 FBPAs, plus 24
+  FBIO interface partitions. These are **SKU-identical** (product-line
+  restriction, same on both cards) — on this SKU the capacity difference
+  versus other parts comes from the HBM die size (0x20c2 = 8 × 8 GB = 64 GB),
+  not from FBP fusing.
+- **Status shadows:** read-only copies the firmware consumes. A `[!= fuse]`
+  flag means a live override has diverged from the fused value.
 
 ## Notes
 
