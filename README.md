@@ -12,6 +12,32 @@ Reads the GA100 floorsweep/restriction fuses straight out of BAR0:
 | `OPT_FBIO_DEFECTIVE` | `0x008205D4` | one bit per FBIO — physically dead             |
 | `OPT_ROP_L2_DISABLE`   | `0x008202C4` | one bit per ROP/L2 slice — fused OFF (mirrors `OPT_FBPA_DISABLE`) |
 | `OPT_ROP_L2_DEFECTIVE` | `0x008205E8` | one bit per ROP/L2 slice — physically dead      |
+| `OPT_NVLINK_DISABLE`   | `0x00820684` | one bit per NVLink group (3) — fused OFF           |
+| `OPT_NVLINK_DISABLE_CP`| `0x00820688` | NVLink CP disable mask                             |
+| `OPT_NVLINK_DEFECTIVE` | `0x0082068C` | one bit per NVLink group — physically dead         |
+| `OPT_PCIE_LANE_DISABLE`| `0x00820394` | one bit per PCIe lane (16) — fused OFF             |
+| `OPT_GEN23`            | `0x0082057C` | Gen2/3 boot disable                                |
+| `OPT_DISABLE_GEN3_SPEED`| `0x00820580` | Gen3 speed disable                                 |
+| `OPT_SPARE_FS`         | `0x00820398` | spare floorsweep mask                              |
+| `FUSE_FB_CONFIG`       | `0x00820328` | framebuffer config fuse                            |
+| `FUSE_HALF_FBPA_EN`    | `0x0082049C` | per-FBPA half-capacity enable                      |
+| `FUSE_ECC_EN`          | `0x00820228` | ECC enable fuse                                    |
+| `OPT_SECURE_GSP_DEBUG_DIS` | `0x0082074C` | secure GSP debug disabled (production part)       |
+| `STATUS_OPT_DISPLAY`   | `0x00820C04` | display-disabled flag                              |
+| `CTRL_OPT_GPC`         | `0x0082081C` | live GPC override (0 = none)                       |
+| `CTRL_OPT_FBIO`        | `0x00820814` | live FBIO override (0 = none)                      |
+| `CTRL_OPT_FBPA`        | `0x00820818` | live FBPA override (0 = none)                      |
+| `CTRL_OPT_PERLINK`     | `0x00820820` | live per-link override (0 = none)                  |
+| `CTRL_OPT_PCIE_LANE`   | `0x0082082C` | live PCIe-lane override (0 = none)                 |
+| `CTRL_OPT_FBP`         | `0x00820938` | live FBP override (0 = none)                       |
+| `CTRL_OPT_NVLINK`      | `0x008209B8` | live NVLink override (0 = none)                    |
+| `FUSE_CTRL_OPT_TPC_GPC`| `0x00820838+i*4` | per-GPC TPC override, one dword per GPC 0..7 (remove-only) |
+| `FUSE_STATUS_OPT_TPC_GPC` | `0x00820C38+i*4` | per-GPC TPC status, one dword per GPC 0..7     |
+| `STATUS_OPT_NVLINK`    | `0x00820DB8` | read-only shadow of `OPT_NVLINK_DISABLE`           |
+| `STATUS_OPT_PCIE_LANE` | `0x00820C2C` | read-only shadow of `OPT_PCIE_LANE_DISABLE`        |
+| `STATUS_SPARE_FS`      | `0x00820C30` | read-only shadow of `OPT_SPARE_FS`                 |
+| `STATUS_FB_CONFIG`     | `0x00820C34` | read-only shadow of `FUSE_FB_CONFIG`               |
+| `STATUS_HALF_FBPA`     | `0x00820C00` | read-only shadow of `FUSE_HALF_FBPA_EN`            |
 | `OPT_FBPA_DISABLE`  | `0x00820368` | one bit per FBPA (24, two per FBP) — OFF         |
 | `OPT_FBIO_DISABLE`  | `0x0082036C` | one bit per FBIO (24) — OFF                      |
 | `STATUS_OPT_GPC`    | `0x00820C1C` | read-only shadow of `OPT_GPC_DISABLE`            |

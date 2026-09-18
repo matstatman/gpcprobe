@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only GA100 floorsweep fuse probe: GPC (compute) + FBP (memory).
+"""Read-only GA100 floorsweep fuse probe: GPC + FBP + ROP/L2 + NVLink + PCIe.
 
 Uses the gpcprobe kernel module (insmod gpcprobe.ko), which ioremaps each
 NVIDIA GPU's BAR0 read-only because the proprietary nvidia driver owns the
@@ -9,24 +9,45 @@ Prints a per-card detail block, then a summary table (card/model/memory via
 nvidia-smi, fuse results from BAR0).
 
 Register map (GA100 BAR0):
-  GPC  OPT_GPC_DISABLE    0x00820350  one bit per GPC
-  GPC  OPT_GPC_DEFECTIVE  0x008205c4  one bit per GPC
-  FBP  OPT_FBP_DISABLE    0x00820364  one bit per FBP   (12 FBPs)
-  FBP  OPT_FBP_DEFECTIVE  0x008205CC  one bit per FBP (physically dead)
-  FBP  OPT_FBPA_DEFECTIVE 0x008205D0  one bit per FBPA (physically dead)
-  FBP  OPT_FBIO_DEFECTIVE 0x008205D4  one bit per FBIO (physically dead)
-
-  ROP  OPT_ROP_L2_DISABLE  0x008202C4  one bit per L2 slice (fused OFF;
-                                       mirrors OPT_FBPA_DISABLE)
-  ROP  OPT_ROP_L2_DEFECTIVE 0x008205E8  one bit per L2 slice (physically dead)
-  FBP  OPT_FBPA_DISABLE   0x00820368  one bit per FBPA  (24)
-  FBP  OPT_FBIO_DISABLE   0x0082036C  one bit per FBIO  (24)
+  GPC   OPT_GPC_DISABLE      0x00820350  one bit per GPC         (8)
+  GPC   OPT_GPC_DEFECTIVE    0x008205c4  one bit per GPC
+  FBP   OPT_FBP_DISABLE      0x00820364  one bit per FBP         (12)
+  FBP   OPT_FBP_DEFECTIVE    0x008205cc  one bit per FBP
+  FBP   OPT_FBPA_DISABLE     0x00820368  one bit per FBPA        (24)
+  FBP   OPT_FBPA_DEFECTIVE   0x008205d0  one bit per FBPA
+  FBP   OPT_FBIO_DISABLE     0x0082036c  one bit per FBIO        (24)
+  FBP   OPT_FBIO_DEFECTIVE   0x008205d4  one bit per FBIO
+  ROP   OPT_ROP_L2_DISABLE    0x008202c4  one bit per LTC (24), mirrors OPT_FBPA_DISABLE
+  ROP   OPT_ROP_L2_DEFECTIVE  0x008205e8  one bit per LTC
+  NVL   OPT_NVLINK_DISABLE    0x00820684  one bit per NVLink group (3)
+  NVL   OPT_NVLINK_DISABLE_CP 0x00820688
+  NVL   OPT_NVLINK_DEFECTIVE  0x0082068c
+  PCIE  OPT_PCIE_LANE_DISABLE  0x00820394 one bit per lane (16)
+  PCIE  OPT_GEN23               0x0082057c Gen2/3 boot disable
+  PCIE  OPT_DISABLE_GEN3_SPEED  0x00820580
+  MISC  OPT_SPARE_FS             0x00820398
+  MISC  FUSE_FB_CONFIG           0x00820328
+  MISC  FUSE_HALF_FBPA_EN        0x0082049c
+  MISC  FUSE_ECC_EN              0x00820228
+  MISC  OPT_SECURE_GSP_DEBUG_DIS 0x0082074c
+  MISC  STATUS_OPT_DISPLAY       0x00820c04 (display-disabled flag)
+  CTRL  CTRL_OPT_GPC 0x0082081c, CTRL_OPT_FBIO 0x00820814,
+        CTRL_OPT_FBPA 0x00820818, CTRL_OPT_PERLINK 0x00820820,
+        CTRL_OPT_PCIE_LANE 0x0082082c, CTRL_OPT_FBP 0x00820938,
+        CTRL_OPT_NVLINK 0x008209b8
+  ARRAYS (one dword per GPC, i = 0..7):
+        FUSE_CTRL_OPT_TPC_GPC   0x00820838 + i*4  (remove-only)
+        FUSE_STATUS_OPT_TPC_GPC 0x00820c38 + i*4
   read-only status shadows:
-        STATUS_OPT_GPC 0x00820C1C   STATUS_FBP 0x00820D38
-        STATUS_FBPA    0x00820C18   STATUS_OPT_FBIO 0x00820C14
+        STATUS_OPT_GPC 0x00820c1c   STATUS_FBP 0x00820d38
+        STATUS_FBPA    0x00820c18   STATUS_OPT_FBIO 0x00820c14
+        STATUS_OPT_NVLINK 0x00820db8   STATUS_OPT_PCIE_LANE 0x00820c2c
+        STATUS_SPARE_FS 0x00820c30     STATUS_FB_CONFIG 0x00820c34
+        STATUS_HALF_FBPA 0x00820c00
   Offsets per JRex286's Ampere fuse probe (gist 0480d2b2) and the
   Consensus-Protocol/cmp170hx register docs; validated on this
-  hardware: every status shadow equals its fuse's value.
+  hardware: every status shadow equals its fuse's value. Bit widths for
+  a few misc fuses are nominal (they only affect the active count).
 """
 import fcntl
 import os
@@ -42,27 +63,74 @@ GP_IOC_READ32 = (3 << 30) | (12 << 16) | (GP_IOC_MAGIC << 8) | 2   # _IOWR('G', 
 # (label, fuse offset, bit width, status shadow offset or None)
 GROUPS = [
     ("GPC  (compute clusters)", [
-        ("OPT_GPC_DISABLE",   0x00820350, 8,  0x00820C1C),
-        ("OPT_GPC_DEFECTIVE", 0x008205C4, 8,  None),
+        ("OPT_GPC_DISABLE",     0x00820350, 8,  0x00820C1C),
+        ("OPT_GPC_DEFECTIVE",   0x008205C4, 8,  None),
     ]),
     ("FBP  (memory partitions)", [
-        ("OPT_FBP_DISABLE",   0x00820364, 12, 0x00820D38),
-        ("OPT_FBP_DEFECTIVE", 0x008205CC, 12, None),
-        ("OPT_FBPA_DISABLE",  0x00820368, 24, 0x00820C18),
-        ("OPT_FBPA_DEFECTIVE", 0x008205D0, 24, None),
-        ("OPT_FBIO_DISABLE",  0x0082036C, 24, 0x00820C14),
-        ("OPT_FBIO_DEFECTIVE", 0x008205D4, 24, None),
+        ("OPT_FBP_DISABLE",     0x00820364, 12, 0x00820D38),
+        ("OPT_FBP_DEFECTIVE",   0x008205CC, 12, None),
+        ("OPT_FBPA_DISABLE",    0x00820368, 24, 0x00820C18),
+        ("OPT_FBPA_DEFECTIVE",  0x008205D0, 24, None),
+        ("OPT_FBIO_DISABLE",    0x0082036C, 24, 0x00820C14),
+        ("OPT_FBIO_DEFECTIVE",  0x008205D4, 24, None),
     ]),
     ("ROP  (raster ops / L2 slices)", [
-        ("OPT_ROP_L2_DISABLE", 0x008202C4, 24, None),
+        ("OPT_ROP_L2_DISABLE",   0x008202C4, 24, None),
         ("OPT_ROP_L2_DEFECTIVE", 0x008205E8, 24, None),
     ]),
+    ("NVLink", [
+        ("OPT_NVLINK_DISABLE",    0x00820684, 3, 0x00820DB8),
+        ("OPT_NVLINK_DISABLE_CP", 0x00820688, 3, None),
+        ("OPT_NVLINK_DEFECTIVE",  0x0082068C, 3, None),
+    ]),
+    ("PCIe (lanes / link speed)", [
+        ("OPT_PCIE_LANE_DISABLE",  0x00820394, 16, 0x00820C2C),
+        ("OPT_GEN23",              0x0082057C, 1,  None),
+        ("OPT_DISABLE_GEN3_SPEED", 0x00820580, 1,  None),
+    ]),
+    ("Misc fuses", [
+        ("OPT_SPARE_FS",             0x00820398, 16, 0x00820C30),
+        ("FUSE_FB_CONFIG",           0x00820328, 4,  0x00820C34),
+        ("FUSE_HALF_FBPA_EN",        0x0082049C, 24, 0x00820C00),
+        ("FUSE_ECC_EN",              0x00820228, 1,  None),
+        ("OPT_SECURE_GSP_DEBUG_DIS", 0x0082074C, 1,  None),
+        ("STATUS_OPT_DISPLAY",       0x00820C04, 1,  None),
+    ]),
+    ("CTRL / override readouts (0 = no live override)", [
+        ("CTRL_OPT_GPC",       0x0082081C, 8,  None),
+        ("CTRL_OPT_FBIO",      0x00820814, 24, None),
+        ("CTRL_OPT_FBPA",      0x00820818, 24, None),
+        ("CTRL_OPT_PERLINK",   0x00820820, 3,  None),
+        ("CTRL_OPT_PCIE_LANE", 0x0082082C, 16, None),
+        ("CTRL_OPT_FBP",       0x00820938, 12, None),
+        ("CTRL_OPT_NVLINK",    0x008209B8, 3,  None),
+    ]),
 ]
+
+# (label, base offset, entry count): one dword per GPC index
+ARRAYS = [
+    ("FUSE_CTRL_OPT_TPC_GPC",   0x00820838, 8),
+    ("FUSE_STATUS_OPT_TPC_GPC", 0x00820C38, 8),
+]
+
 STATUS_NAMES = {
     0x00820C1C: "STATUS_OPT_GPC",
     0x00820D38: "STATUS_FBP",
     0x00820C18: "STATUS_FBPA",
     0x00820C14: "STATUS_OPT_FBIO",
+    0x00820DB8: "STATUS_OPT_NVLINK",
+    0x00820C2C: "STATUS_OPT_PCIE_LANE",
+    0x00820C30: "STATUS_SPARE_FS",
+    0x00820C34: "STATUS_FB_CONFIG",
+    0x00820C00: "STATUS_HALF_FBPA",
+}
+
+# group title -> (disable label, defective label, width)
+DELTA = {
+    "GPC": ("OPT_GPC_DISABLE", "OPT_GPC_DEFECTIVE", 8),
+    "FBP": ("OPT_FBP_DISABLE", "OPT_FBP_DEFECTIVE", 12),
+    "ROP": ("OPT_ROP_L2_DISABLE", "OPT_ROP_L2_DEFECTIVE", 24),
+    "NVLink": ("OPT_NVLINK_DISABLE", "OPT_NVLINK_DEFECTIVE", 3),
 }
 
 
@@ -92,8 +160,8 @@ def gpu_meta():
         if len(parts) >= 3:
             try:
                 # nvidia-smi pads the domain to 8 hex digits; normalize to 4
-                dom, rest = parts[0].lower().split(':', 1)
-                meta[dom[-4:] + ':' + rest] = (parts[1], int(parts[2]))
+                dom, rest = parts[0].lower().split(":", 1)
+                meta[dom[-4:] + ":" + rest] = (parts[1], int(parts[2]))
             except (ValueError, AttributeError):
                 pass
     return meta
@@ -138,18 +206,27 @@ def main():
             print(f"  {title}")
             for label, off, width, status_off in regs:
                 vals[label] = rd(i, off)
-                bits = bits_set(vals[label], width)
-                print(f"    {label:<18} 0x{vals[label]:08x}  "
-                      f"{label.split('_')[1]}s {fmt(bits):<22} "
-                      f"{width - len(bits)}/{width} active")
-            delta = {"GPC": ("OPT_GPC_DISABLE", "OPT_GPC_DEFECTIVE", 8),
-                     "FBP": ("OPT_FBP_DISABLE", "OPT_FBP_DEFECTIVE", 12),
-                     "ROP": ("OPT_ROP_L2_DISABLE", "OPT_ROP_L2_DEFECTIVE", 24)}
-            if title.split()[0] in delta:
-                dis_l, def_l, w = delta[title.split()[0]]
+                if title.startswith("CTRL"):
+                    note = "(no override)" if vals[label] == 0 else "OVERRIDE PRESENT!"
+                    print(f"    {label:<24} 0x{vals[label]:08x}  {note}")
+                elif width == 1:
+                    print(f"    {label:<24} 0x{vals[label]:08x}  "
+                          f"bit0 {'set' if vals[label] & 1 else 'clear'}")
+                else:
+                    bits = bits_set(vals[label], width)
+                    print(f"    {label:<24} 0x{vals[label]:08x}  "
+                          f"bits {fmt(bits):<24} {width - len(bits)}/{width} active")
+            if title.split()[0] in DELTA:
+                dis_l, def_l, w = DELTA[title.split()[0]]
                 not_def = sorted(set(bits_set(vals[dis_l], w)) -
                                  set(bits_set(vals[def_l], w)))
-                print(f"    {'disabled not defective':<18} {'':1s}  {fmt(not_def)}")
+                print(f"    {'disabled not defective':<24} {'':4s} {fmt(not_def)}")
+
+        print("  TPC/GPC arrays (one dword per GPC)")
+        for name_, base, n in ARRAYS:
+            s = "  ".join(f"{k}:0x{rd(i, base + 4 * k):02x}" for k in range(n))
+            print(f"    {name_:<24} {s}")
+
         print("  status shadows (should equal fuses)")
         for status_off, sname in STATUS_NAMES.items():
             val = rd(i, status_off)
@@ -158,7 +235,7 @@ def main():
                     if so == status_off:
                         fuse_val = vals[label]
                         flag = "ok" if val == fuse_val else f"!= fuse 0x{fuse_val:08x}!"
-                        print(f"    {sname:<18} 0x{val:08x}  [{flag}]")
+                        print(f"    {sname:<24} 0x{val:08x}  [{flag}]")
         print()
 
         gpc_d, gpc_f = vals["OPT_GPC_DISABLE"], vals["OPT_GPC_DEFECTIVE"]
