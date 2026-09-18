@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Read-only GA100 floorsweep fuse probe: GPC + FBP + ROP/L2 + NVLink + PCIe.
+"""Read-only GA100 floorsweep fuse probe: GPC + FBP + ROP/L2 + NVLink + PCIe + HBM.
 
 Uses the gpcprobe kernel module (insmod gpcprobe.ko), which ioremaps each
 NVIDIA GPU's BAR0 read-only because the proprietary nvidia driver owns the
 BARs and blocks the usual sysfs resource0 / /dev/mem paths.
 
-Prints a per-card detail block, then a summary table (card/model/memory via
+Prints a per-card detail block (fuse groups, I1500 HBM debug bridge, FBPA HBM
+config, decoded HBM stack table), then a summary table (card/model/memory via
 nvidia-smi, fuse results from BAR0).
 
 Register map (GA100 BAR0):
@@ -44,10 +45,39 @@ Register map (GA100 BAR0):
         STATUS_OPT_NVLINK 0x00820db8   STATUS_OPT_PCIE_LANE 0x00820c2c
         STATUS_SPARE_FS 0x00820c30     STATUS_FB_CONFIG 0x00820c34
         STATUS_HALF_FBPA 0x00820c00
-  Offsets per JRex286's Ampere fuse probe (gist 0480d2b2) and the
-  Consensus-Protocol/cmp170hx register docs; validated on this
-  hardware: every status shadow equals its fuse's value. Bit widths for
-  a few misc fuses are nominal (they only affect the active count).
+  I1500 IEEE 1500 HBM debug bridge (raw readouts, not bitmasks):
+        I1500_INSTR       0x009A3CB4  latched instruction (boot residue)
+        I1500_MODE        0x009A3CB8  latched mode
+        I1500_DATA        0x009A3CBC  latched data
+        I1500_SHADOW_WIR  0x009A3CC0  RO, last WIR shifted in
+        I1500_SHADOW_WDR  0x009A3CC4  RO, per-die WDR
+        I1500_STATUS      0x009A3CC8  0 = idle
+        The bridge is driven by the PKC-encrypted FB Falcon at boot (the GSP
+        never touches it: no I1500 accesses in gsp_ga10x.bin), so live reads
+        show latched boot residue, not a clean DEVICE_ID. A clean read needs
+        WIR shift-in, i.e. register writes.
+  FBPA HBM config (raw readouts, broadcast window):
+        FBPA_NUM_ACTIVE       0x009A0164  active FBP count
+        FBPA_CFG0_BROADCAST   0x009A0200
+        FBPA_CFG1_BROADCAST   0x009A0204  0x02779000 = A100-80GB HBM2E config
+        FBPA_MRS_0            0x009A0300
+        FBPA_MRS_1            0x009A0304
+        FBPA_MRS_8            0x009A0320  density MR
+        FBPA_MRS_2            0x009A0334
+        FBPA_MRS_WL_RL        0x009A0338
+        FBPA_HBM_CFG0         0x009A038C
+        FBPA_ECC_CTRL         0x009A0470  GPU-side ECC datapath (0 = off)
+        FBPA_VEND_ID_C0       0x009A0838
+        FBPA_VEND_ID_C1       0x009A083C
+        FBPA_TRAINING_STATUS  0x009A0974  0 = not in training
+  HBM stack topology (decoded by the script from the FBP/FBPA fuses):
+        6 stacks; stack s = FBP {2s, 2s+1} = FBPA {4s..4s+3}
+        1 FBPA = 1 HBM channel (256-bit) = 2 DRAM dies; full stack = 8 dies
+  Offsets per JRex286's Ampere fuse probe (gist 0480d2b2), the
+  Consensus-Protocol/cmp170hx register docs, and the NVIDIA RM source
+  (nv_fusefuse_ga100.h / fbpa defs); validated on this hardware: every
+  status shadow equals its fuse's value. Bit widths for a few misc fuses
+  are nominal (they only affect the active count).
 """
 import fcntl
 import os
@@ -107,6 +137,33 @@ GROUPS = [
     ]),
 ]
 
+# (label, offset, note) — raw 32-bit readouts, not fuse bitmasks
+RAW_GROUPS = [
+    ("I1500 HBM debug bridge (latched boot residue)", [
+        ("I1500_INSTR",      0x009A3CB4, "latched instruction"),
+        ("I1500_MODE",       0x009A3CB8, "latched mode"),
+        ("I1500_DATA",       0x009A3CBC, "latched data"),
+        ("I1500_SHADOW_WIR", 0x009A3CC0, "RO, last WIR shifted in"),
+        ("I1500_SHADOW_WDR", 0x009A3CC4, "RO, per-die WDR"),
+        ("I1500_STATUS",     0x009A3CC8, "0 = idle"),
+    ]),
+    ("FBPA HBM config (broadcast window)", [
+        ("FBPA_NUM_ACTIVE",      0x009A0164, "active FBP count"),
+        ("FBPA_CFG0_BROADCAST",  0x009A0200, "HBM config"),
+        ("FBPA_CFG1_BROADCAST",  0x009A0204, "0x02779000 = A100-80GB HBM2E config"),
+        ("FBPA_MRS_0",           0x009A0300, None),
+        ("FBPA_MRS_1",           0x009A0304, None),
+        ("FBPA_MRS_8",           0x009A0320, "density MR (0x20 on all 15 ref cards)"),
+        ("FBPA_MRS_2",           0x009A0334, None),
+        ("FBPA_MRS_WL_RL",       0x009A0338, None),
+        ("FBPA_HBM_CFG0",        0x009A038C, None),
+        ("FBPA_ECC_CTRL",        0x009A0470, "GPU-side ECC datapath (0 = off)"),
+        ("FBPA_VEND_ID_C0",      0x009A0838, "0 on all 15 ref cards"),
+        ("FBPA_VEND_ID_C1",      0x009A083C, "0 on all 15 ref cards"),
+        ("FBPA_TRAINING_STATUS", 0x009A0974, "0 = not in training"),
+    ]),
+]
+
 # (label, base offset, entry count): one dword per GPC index
 ARRAYS = [
     ("FUSE_CTRL_OPT_TPC_GPC",   0x00820838, 8),
@@ -132,6 +189,8 @@ DELTA = {
     "ROP": ("OPT_ROP_L2_DISABLE", "OPT_ROP_L2_DEFECTIVE", 24),
     "NVLink": ("OPT_NVLINK_DISABLE", "OPT_NVLINK_DEFECTIVE", 3),
 }
+
+NUM_STACKS = 6  # GA100 HBM stack slots
 
 
 def bits_set(mask, width):
@@ -172,6 +231,52 @@ def fmt_mem(mib):
         return "?"
     gib = mib / 1024
     return f"{gib:.0f} GiB" if gib == int(gib) else f"{gib:.1f} GiB"
+
+
+def stack_report(vals, mib):
+    """Decode the FBP/FBPA fuses into the 6 HBM stacks and print sizes.
+
+    Stack s = FBP {2s, 2s+1} = FBPA {4s..4s+3}. One FBPA is one 256-bit HBM
+    channel holding 2 DRAM dies, so a full stack is 4 FBPAs = 8 dies. The
+    per-FBPA size is the nvidia-smi total divided by the active FBPA count
+    (the CFG1/CSTATUS broadcast window), so the table reflects the config the
+    card is currently running in (stock 512 MiB/FBPA vs 4 GiB/FBPA unlocked).
+    """
+    dis = set(bits_set(vals["OPT_FBPA_DISABLE"], 24))
+    dfc = set(bits_set(vals["OPT_FBPA_DEFECTIVE"], 24))
+    f_dis = set(bits_set(vals["OPT_FBP_DISABLE"], 12))
+    f_dfc = set(bits_set(vals["OPT_FBP_DEFECTIVE"], 12))
+    active = [k for k in range(24) if k not in dis and k not in dfc]
+    per = (mib // len(active)
+           if mib and active and mib % len(active) == 0 else None)
+
+    print("  HBM stacks (stack s = FBP 2s,2s+1 = FBPA 4s..4s+3; 1 FBPA = 1 channel = 2 dies)")
+    print(f"    {'stk':<4} {'FBP':<6} {'FBPA active':<15} {'dies':<5} {'state':<24} size")
+    for s in range(NUM_STACKS):
+        fbpas = range(4 * s, 4 * s + 4)
+        act = [k for k in fbpas if k not in dis and k not in dfc]
+        dies = 2 * len(act)
+        state = {4: "full", 2: "half", 0: "dead"}.get(len(act), f"odd ({len(act)}/4)")
+        if len(act) < 4:
+            reasons = []
+            for f in (2 * s, 2 * s + 1):
+                if f in f_dfc:
+                    reasons.append(f"FBP{f} def")
+                elif f in f_dis:
+                    reasons.append(f"FBP{f} dis")
+            if reasons:
+                state += " (" + ", ".join(reasons) + ")"
+        size = fmt_mem(per * len(act)) if per else "?"
+        print(f"    {s:<4} {2*s},{2*s+1:<3} {fmt(act):<15} {dies}/8  {state:<24} {size}")
+
+    parts = [f"{len(active)}/24 FBPA = {256 * len(active)}-bit"]
+    if per:
+        parts.append(f"per-FBPA {fmt_mem(per)}")
+        parts.append(f"die {fmt_mem(per // 2)}")
+        if mib:
+            parts.append(f"{fmt_mem(mib)} exposed")
+            parts.append(f"{fmt_mem(NUM_STACKS * 8 * per // 2)} max (all 48 die slots)")
+    print("    " + "  |  ".join(parts))
 
 
 def main():
@@ -221,6 +326,15 @@ def main():
                 not_def = sorted(set(bits_set(vals[dis_l], w)) -
                                  set(bits_set(vals[def_l], w)))
                 print(f"    {'disabled not defective':<24} {'':4s} {fmt(not_def)}")
+
+        for title, regs in RAW_GROUPS:
+            print(f"  {title}")
+            for label, off, note in regs:
+                vals[label] = rd(i, off)
+                suffix = f"  ({note})" if note else ""
+                print(f"    {label:<24} 0x{vals[label]:08x}{suffix}")
+
+        stack_report(vals, mib)
 
         print("  TPC/GPC arrays (one dword per GPC)")
         for name_, base, n in ARRAYS:
