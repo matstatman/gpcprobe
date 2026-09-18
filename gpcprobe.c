@@ -66,7 +66,9 @@ static long gp_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			return -EFAULT;
 		if (r.idx >= ncards)
 			return -EINVAL;
-		if (r.off + 4 > cards[r.idx].size)
+		if (r.off & 3)
+			return -EINVAL;
+		if (r.off > cards[r.idx].size - 4)
 			return -ERANGE;
 		r.val = readl(cards[r.idx].map + r.off);
 		if (copy_to_user((void __user *)arg, &r, sizeof(r)))
