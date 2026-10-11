@@ -113,16 +113,20 @@ taken out of four different stacks. Dies are 2 GiB (16 Gb) class
 (4 GiB/FBPA ÷ 2 dies), so the board carries up to 96 GiB of DRAM in its
 48 die slots.
 
-The 10 GB sibling (device id 0x2082) is 20/24 FBPA = 5120-bit and unlocks
-to 80 GiB (20 × 4 GiB) — same die size, more FBP fuses intact. The stock
-8 vs 10 GB difference is **FBP fusing**, not die size.
+The 10 GB sibling (device id 0x2082) is 20/24 FBPA = 5120-bit. Dies on that
+board are 1 GiB (8 Gb) class, so it carries up to 48 GiB of DRAM in its 48
+die slots. Stock 8 vs 10 GiB is 16 vs 20 FBPA at a 512 MiB window; the
+ceilings are 96 GiB (16 Gb dies) and 48 GiB (8 Gb dies).
 
 ### HBM generation / ECC
 
 `FBPA_CFG1_BROADCAST = 0x02779000` (the A100-80 GB HBM2E config) bringing up
-64 GiB, plus the identical density MR (`FBPA_MRS_8 = 0x20`) across all 15
-reference cards (8/10 GB CMP *and* 40/80 GB A100), points to HBM2E 16 Gb
-dies — which have on-die ECC silicon (plain HBM2 does not). The RAMCFG board
+64 GiB on the 8 GB boards, with 96 GiB in the 48 die slots, points to HBM2E
+16 Gb dies on that SKU — which have on-die ECC silicon (plain HBM2 does not).
+The same density MR (`FBPA_MRS_8 = 0x20`) is present on all 15 reference
+cards (8/10 GB CMP and 40/80 GB A100). That shared value does not make the
+10 GB SKU 16 Gb: its ceiling is 48 GiB, which is 8 Gb (1 GiB) dies across
+the same 48 slots. The RAMCFG board
 strap (A100 datasheet: `00100` = Samsung HBM2 8 Gb, `01111` = Hynix HBM2E
 16 Gb, `01010` = Micron HBM2E 16 Gb) is sampled by the FB Falcon, not the
 floorsweep (`FUSE_FB_CONFIG = 0` on both cards), so the exact vendor is not
