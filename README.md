@@ -2,7 +2,10 @@
 
 Reads the GA100 floorsweep/restriction fuses straight out of BAR0, plus the
 HBM controller readouts (I1500 debug bridge + FBPA config), and decodes the
-fuses into the physical HBM stack layout.
+fuses into the physical HBM stack layout. The same `/dev/gpcprobe` read-only
+window also backs **`blackbox.py`**, an offline/live decoder for the inforom
+journal & settings objects (BBX / DEM / OMS) — see
+[blackbox.py](#blackboxpy--inforom-black-box-dump-bbx--dem--oms) below.
 
 ## Register table
 
@@ -156,11 +159,12 @@ exposing 32-bit reads through `/dev/gpcprobe` via ioctl.
 
 ## Files
 
-| File          | What it is                                  |
-|---------------|---------------------------------------------|
-| `gpcprobe.c`  | the kernel module                           |
-| `Makefile`    | out-of-tree build against the running kernel|
-| `gpc_probe.py`| Python frontend — auto-discovers all cards, no hardcoded BDF list |
+| File           | What it is                                  |
+|----------------|---------------------------------------------|
+| `gpcprobe.c`   | the kernel module                           |
+| `Makefile`     | out-of-tree build against the running kernel|
+| `gpc_probe.py` | Python frontend — auto-discovers all cards, no hardcoded BDF list |
+| `blackbox.py`  | inforom black-box dump (BBX / DEM / OMS), live or from `.rom` captures; self-contained reader core |
 
 ## Build
 
@@ -191,6 +195,9 @@ sudo dmesg | grep gpcprobe
 
 # 2. probe (needs root for /dev/gpcprobe)
 sudo python3 gpc_probe.py
+
+# 2b. or dump the inforom black-box (same /dev/gpcprobe, read-only)
+sudo python3 blackbox.py live
 
 # 3. unload when done
 sudo rmmod gpcprobe
@@ -300,6 +307,35 @@ sudo rmmod gpcprobe
   nobody has decoded it into vendor/density yet.
 - **Status shadows:** read-only copies the firmware consumes. A `[!= fuse]`
   flag means a live override has diverged from the fused value.
+
+## blackbox.py — inforom black-box dump (BBX / DEM / OMS)
+
+Second frontend on the same ioctl ABI: the three persistent objects the card
+writes itself (a factory BI copy in the zlib BI container + a live JFFS
+generation tree). All reads go through the NV_PROM aperture — BAR0 +
+`0x300000`, the 1 MiB flash window — so this module's 16 MiB mapping covers
+it fully.
+
+| Object | Size   | What it is                                                            |
+|--------|--------|------------------------------------------------------------------------|
+| `BBX`  | `0x5940` | board boot / POH journal: install & last-boot stamps, uptime, boot count, power-cap history pairs, 178-block boot-journal ring (inner schema `[OPEN]`) |
+| `DEM`  | `0x1030` | persistent event log — 4 KiB FIFO of `{u8 size, xid, flags, xidExt, u32 seq, unix-ts, NUL text}` records, chain walked on size and validated on seq continuity |
+| `OMS`  | `0x70`   | operational-mode settings: `lifetimeRefreshCount` + 8 V1G entries with the two's-complement byte-sum checksum; FF = unset sentinel |
+
+Wide objects (BBX/DEM) are rebuilt from the offset-tagged JFFS chunk grid
+(newest-chunk-wins, mod-256 serial ordering); unwritten holes render as FF.
+Every JFFS generation is decoded and graded against the BI copy (`=BI` /
+`!=BI`) — the live/dead discriminator is still `[OPEN]`, so nothing is
+silently dropped.
+
+```sh
+sudo python3 blackbox.py live                      # all 3 objects, all cards
+sudo python3 blackbox.py live --bdf 06 --only dem  # one card, event log only
+python3 blackbox.py cap09.rom                      # offline: 1 MiB aperture capture
+python3 blackbox.py 170hx_05_nvflash.rom --only bbx  # nvflash 0xFF000 pull
+python3 blackbox.py cap09.rom --only oms --full    # + empty blocks and raw hex
+```
+
 
 ## Notes
 
