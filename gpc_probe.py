@@ -6,8 +6,10 @@ NVIDIA GPU's BAR0 read-only because the proprietary nvidia driver owns the
 BARs and blocks the usual sysfs resource0 / /dev/mem paths.
 
 Prints a per-card detail block (fuse groups, I1500 HBM debug bridge, FBPA HBM
-config, decoded HBM stack table), then a summary table (card/model/memory via
-nvidia-smi, fuse results from BAR0).
+config, decoded HBM stack table, per-GPC TPC masks including
+OPT_TPC_GPC[i]_DEFECTIVE, SM census from the TPC status arrays), then a
+summary table (card/model/memory via nvidia-smi, fuses and SM total from
+BAR0).
 
 Register map (GA100 BAR0):
   GPC   OPT_GPC_DISABLE      0x00820350  one bit per GPC         (8)
@@ -36,9 +38,19 @@ Register map (GA100 BAR0):
         CTRL_OPT_FBPA 0x00820818, CTRL_OPT_PERLINK 0x00820820,
         CTRL_OPT_PCIE_LANE 0x0082082c, CTRL_OPT_FBP 0x00820938,
         CTRL_OPT_NVLINK 0x008209b8
-  ARRAYS (one dword per GPC, i = 0..7):
-        FUSE_CTRL_OPT_TPC_GPC   0x00820838 + i*4  (remove-only)
-        FUSE_STATUS_OPT_TPC_GPC 0x00820c38 + i*4
+  TPC (one dword per GPC, i = 0..7; low byte, bit t = TPC t):
+        OPT_TPC_GPC[i]_DEFECTIVE  scattered; a set bit is bad silicon
+            0 0x008205c8  1 0x00820508  2 0x0082050c  3 0x00820514
+            4 0x00820564  5 0x008205ac  6 0x00820b84  7 0x00820b80
+        OPT_TPC_GPC[i]_DISABLE    0x00820760 + i*4   fuseless floorsweep
+        OPT_TPC_GPC[i]_RECONFIG   0x00820788 + i*4 for GPC 0-5;
+                                  GPC 6 0x00820b94, GPC 7 0x00820b90
+        FUSE_CTRL_OPT_TPC_GPC     0x00820838 + i*4   SW override input
+        RECONFIG_OVERRIDE         0x00820a40 + i*4   drops a reconfig bit
+        FUSE_STATUS_OPT_TPC_GPC   0x00820c38 + i*4   effective mask
+        With CTRL and RECONFIG_OVERRIDE at 0, STATUS = DISABLE | RECONFIG.
+        STATUS also holds SKU-disable and reconfig bits; it is not the
+        defective fuse.
   read-only status shadows:
         STATUS_OPT_GPC 0x00820c1c   STATUS_FBP 0x00820d38
         STATUS_FBPA    0x00820c18   STATUS_OPT_FBIO 0x00820c14
@@ -164,11 +176,45 @@ RAW_GROUPS = [
     ]),
 ]
 
-# (label, base offset, entry count): one dword per GPC index
-ARRAYS = [
-    ("FUSE_CTRL_OPT_TPC_GPC",   0x00820838, 8),
-    ("FUSE_STATUS_OPT_TPC_GPC", 0x00820C38, 8),
-]
+# Per-GPC TPC shadows. DEFECTIVE is not a stride. DATA[7:0] of each fuse
+# shadow is TPC 0..7; a set bit is that TPC.
+# DEFECTIVE = bad silicon. DISABLE = fuseless floorsweep. RECONFIG is the
+# reconfig fuse (GPC 6/7 leave the 0x00820788 stride). STATUS is the
+# effective mask the chip consumes; with CTRL and RECONFIG_OVERRIDE at 0,
+# STATUS = DISABLE | RECONFIG. RECONFIG_OVERRIDE drops a reconfig bit
+# out of STATUS.
+TPC_DEFECTIVE = (
+    0x008205C8,  # GPC 0
+    0x00820508,  # GPC 1
+    0x0082050C,  # GPC 2
+    0x00820514,  # GPC 3
+    0x00820564,  # GPC 4
+    0x008205AC,  # GPC 5
+    0x00820B84,  # GPC 6
+    0x00820B80,  # GPC 7
+)
+TPC_CTRL_BASE = 0x00820838
+TPC_STATUS_BASE = 0x00820C38
+TPC_OVERRIDE_BASE = 0x00820A40
+
+
+def tpc_disable_off(g):
+    return 0x00820760 + 4 * g
+
+
+def tpc_reconfig_off(g):
+    if g <= 5:
+        return 0x00820788 + 4 * g
+    return 0x00820B94 if g == 6 else 0x00820B90
+
+
+# GPC structure for the SM census: each GPC has 8 TPC slot positions in the
+# status byte; every live GPC on this die fuses one out (stock 0x01), leaving
+# 7 TPC x 2 SM = 14 SM/GPC. STATUS_OPT_TPC is the effective state (it reflects
+# the reconfig-override writes: 0x01 -> 0x00 there showed up as +2 SM and CUDA
+# agreed).
+TPC_SLOTS_PER_GPC = 8
+SM_PER_TPC = 2
 
 STATUS_NAMES = {
     0x00820C1C: "STATUS_OPT_GPC",
@@ -279,6 +325,95 @@ def stack_report(vals, mib):
     print("    " + "  |  ".join(parts))
 
 
+def _tpc_row(g, dfc, dis, rec, st, ct, ov, bad):
+    return (f"    {g:<3}  {dfc:<10}  {dis:<8}  {rec:<9}  "
+            f"{st:<7}  {ct:<6}  {ov:<4}  {bad}")
+
+
+def tpc_report(rd):
+    """Print the per-GPC TPC masks and return (ctrl[], status[]).
+
+    OPT_TPC_GPC[i]_DEFECTIVE is the bad-silicon byte. STATUS is the
+    effective floorsweep and also contains SKU-disable and reconfig, so
+    it is the wrong register for "is this TPC defective". With CTRL at 0,
+    STATUS = (DISABLE | RECONFIG) & ~RECONFIG_OVERRIDE.
+    """
+    print("  TPC per GPC (defective = bad silicon; status = effective mask)")
+    print(_tpc_row("GPC", "defective", "disable", "reconfig",
+                   "status", "ctrl", "ovr", "bad TPCs"))
+    ctrl, status = [], []
+    bad_parts = []
+    for g in range(8):
+        dfc = rd(TPC_DEFECTIVE[g]) & 0xFF
+        dis = rd(tpc_disable_off(g)) & 0xFF
+        rec = rd(tpc_reconfig_off(g)) & 0xFF
+        st = rd(TPC_STATUS_BASE + 4 * g)
+        ct = rd(TPC_CTRL_BASE + 4 * g)
+        ov = rd(TPC_OVERRIDE_BASE + 4 * g)
+        status.append(st)
+        ctrl.append(ct)
+        bits = bits_set(dfc, 8)
+        if bits:
+            bad_parts.append(f"GPC {g} TPC {fmt(bits)}")
+        expect = (dis | rec) & ~(ov & 0xFF) & 0xFF
+        flag = ""
+        if (ct & 0xFF) == 0 and (st & 0xFF) != expect:
+            flag = "   status != (disable|reconfig) & ~override"
+        elif ((ov & 0xFF) and (ct & 0xFF) == 0 and (st & 0xFF) == expect
+              and (rec & ov & 0xFF)):
+            flag = "   reconfig dropped from status"
+        if st & ~0xFF or ct & ~0xFF or ov & ~0xFF:
+            flag += (f"   full st=0x{st:08x} ctrl=0x{ct:08x} ovr=0x{ov:08x}")
+        print(_tpc_row(g, f"0x{dfc:02x}", f"0x{dis:02x}", f"0x{rec:02x}",
+                       f"0x{st & 0xFF:02x}", f"0x{ct & 0xFF:02x}",
+                       f"0x{ov & 0xFF:02x}", f"{fmt(bits)}{flag}"))
+    print("    bad silicon: " + ("; ".join(bad_parts) if bad_parts else "none"))
+    return ctrl, status
+
+
+def sm_report(vals, fuse_tpc, stat_tpc):
+    """Per-GPC SM census — how many SMs are active in each GPC.
+
+    SMs = 2 per TPC (SM_PER_TPC); a GPC's live TPC count is 8 minus the
+    popcount of its STATUS_OPT_TPC byte (TPC_SLOTS_PER_GPC). The STATUS
+    array is the effective TPC-disable state — it includes the reconfig
+    override writes, so a 0x01 -> 0x00 unlock reads as +2 SM here — which
+    is what makes this the register-side witness for the SM count (CUDA
+    confirmed 70 stock -> 74 after the GPC 4/5 reconfig unlock). GPCs that
+    are fused off (OPT_GPC_DISABLE) or runtime-disabled (CTRL_OPT_GPC) or
+    defective contribute 0 SM. A fuse-vs-status divergence per GPC flags
+    a live reconfig override in place. Returns the card's total SM count.
+    """
+    gpc_dfc = set(bits_set(vals["OPT_GPC_DEFECTIVE"], 8))
+    gpc_fus = set(bits_set(vals["OPT_GPC_DISABLE"], 8))
+    gpc_ctl = set(bits_set(vals["CTRL_OPT_GPC"], 8))
+
+    print("  SM census (2 SM/TPC, 8 TPC slots/GPC; STATUS = effective state)")
+    print(f"    {'GPC':<5} {'state':<14} {'fuse TPC':<10} {'status TPC':<12} "
+          f"{'TPC':<6} {'SM'}")
+    n_gpc = n_tpc = n_sm = 0
+    for g in range(8):
+        if g in gpc_dfc:
+            state = "defective"
+        elif g in gpc_fus or g in gpc_ctl:
+            state = ("disabled"
+                     + (" (ctrl)" if g in gpc_ctl - gpc_fus else ""))
+        else:
+            state = "active"
+        st = stat_tpc[g] & 0xFF
+        tpc = TPC_SLOTS_PER_GPC - bin(st).count("1")
+        if state == "active":
+            n_gpc += 1
+            n_tpc += tpc
+            n_sm += tpc * SM_PER_TPC
+        ovr = (f"   <- override (fuse 0x{fuse_tpc[g] & 0xFF:02x})"
+               if fuse_tpc[g] != stat_tpc[g] else "")
+        print(f"    {g:<5} {state:<14} 0x{fuse_tpc[g] & 0xFF:02x}     "
+              f"0x{st:02x}       {tpc}/8    {tpc * SM_PER_TPC if state == 'active' else 0}{ovr}")
+    print(f"    total: {n_gpc}/8 GPC active, {n_tpc} TPC, {n_sm} SM")
+    return n_sm
+
+
 def main():
     try:
         fd = os.open("/dev/gpcprobe", os.O_RDWR)
@@ -336,10 +471,8 @@ def main():
 
         stack_report(vals, mib)
 
-        print("  TPC/GPC arrays (one dword per GPC)")
-        for name_, base, n in ARRAYS:
-            s = "  ".join(f"{k}:0x{rd(i, base + 4 * k):02x}" for k in range(n))
-            print(f"    {name_:<24} {s}")
+        ctrl_tpc, stat_tpc = tpc_report(lambda off: rd(i, off))
+        n_sm = sm_report(vals, ctrl_tpc, stat_tpc)
 
         print("  status shadows (should equal fuses)")
         for status_off, sname in STATUS_NAMES.items():
@@ -362,10 +495,11 @@ def main():
             str(12 - len(bits_set(fb_d, 12))),
             str(len(bits_set(fb_d, 12))),
             str(len(bits_set(fb_f, 12))),
+            str(n_sm),
         ])
 
     headers = ["Card", "GPC healthy", "GPC disabled", "GPC defective",
-               "FBP healthy", "FBP disabled", "FBP defective"]
+               "FBP healthy", "FBP disabled", "FBP defective", "SM total"]
     table = [headers] + rows
     widths = [max(len(str(r[c])) for r in table) for c in range(len(headers))]
     print("Summary")
